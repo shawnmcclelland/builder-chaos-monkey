@@ -1,19 +1,51 @@
 #!/usr/bin/env node
 /**
  * Usage examples:
- *   node burst-builder.js --projectUrl "https://builder.io/app/projects/8987b47c30d54d449a78149d09072b7f/zenith-landing" --tabs 5
- *   node burst-builder.js --tabs 5 --headless
+ *   node burst-builder.js --tabs 5
+ *   node burst-builder.js --tabs 10 --headless
+ *   node burst-builder.js --tabs 20 --model gpt-5
+ *   node burst-builder.js --tabs 5 --model claude-sonnet-4 --headless
  *
  * What it does:
- *  1) Opens https://builder.io/projects (dashboard) so your session/cookies load.
- *  2) Opens the specific project in N tabs.
- *  3) When each tab signals "loaded", it triggers your “prompt” action across all tabs.
+ *  1) Opens https://builder.io/app/projects (main projects page) so your session/cookies load.
+ *  2) Opens N tabs of the main projects page.
+ *  3) Selects the specified AI model from the dropdown.
+ *  4) Uses the main prompt interface to create new projects by submitting prompts.
+ *  5) Each tab creates a separate new project, providing true load testing.
+ *
+ * Load Testing Approach:
+ *  - Creates multiple NEW projects instead of opening the same project multiple times
+ *  - Each tab hits different virtual machines/resources
+ *  - More realistic load testing of Builder.io infrastructure
+ *  - Uses the main prompt interface: "What should we build?"
+ *  - Configurable AI model selection for cost/quality optimization
+ *
+ * Space Configuration:
+ *  - Always uses ILC space (API Key: 51e45e690e6b4298bfdf7c4a3331edf6)
+ *  - Space ID: 27584ede79c245538e7204704ba66afe
+ *  - This ensures consistent API key usage across all tabs
+ *  - No space selection needed - always uses ILC space
+ *
+ * Available Parameters:
+ *  --tabs: Number of tabs to open (default: 5, max: 55)
+ *  --headless: Run browser in headless mode
+ *  --model: AI model to use (default: gpt-5-mini)
+ *    Options: gpt-5-mini, gpt-5, claude-sonnet-4, grok-code-fast, auto
+ *  --promptSelector: Custom selector for prompt button (fallback)
+ *  --userDataDir: Directory for browser user data
+ *
+ * Model Options:
+ *  - gpt-5-mini: Quality B, Cost 0.1x (default - cost efficient)
+ *  - gpt-5: Quality A, Cost 0.4x (balanced)
+ *  - claude-sonnet-4: Quality A, Cost 1x (highest quality)
+ *  - grok-code-fast: Quality B, Cost 0.1x (fast)
+ *  - auto: Automatic selection (currently: Claude Sonnet 4)
  *
  * Assumptions:
- *  - You’re already signed in to Builder in Chrome. This script starts a persistent context
+ *  - You're already signed in to Builder in Chrome. This script starts a persistent context
  *    so you can reuse the same session between runs (see USER_DATA_DIR).
- *  - If the “Prompt” action isn’t a button literally named “Prompt”, set a custom selector via
- *    --promptSelector ".your-button[data-action='prompt']"
+ *  - The main prompt interface is available on the projects page.
+ *  - Each prompt submission will create a new project.
  */
 
 const { chromium } = require('playwright');
@@ -22,46 +54,28 @@ const crypto = require('crypto');
 
 
 const args = minimist(process.argv.slice(2), {
-  string: ['projectUrl', 'promptSelector', 'userDataDir', 'space'],
-  boolean: ['headless', 'createBranches'],
+  string: ['promptSelector', 'userDataDir', 'model'],
+  boolean: ['headless'],
   default: {
     tabs: 5,
     headless: false,
-    projectUrl: 'https://builder.io/app/projects/54a6f2593dcf44f98778a5543b209e5d',
     promptSelector: '', // optional override
     userDataDir: './.playwright-user',
-    createBranches: false,
-    space: 'auto' // auto, ilc, tlf
+    model: 'gpt-5-mini' // default to GPT-5 Mini for cost efficiency
   }
 });
 
 const TABS = Math.max(1, Math.min(Number(args.tabs) || 5, 55)); // Increased limit to 55 for large-scale testing
-const PROJECT_URL = args.projectUrl?.replace(/^["']|["']$/g, ''); // Remove surrounding quotes
 const PROMPT_SELECTOR_OVERRIDE = args.promptSelector?.trim();
 const USER_DATA_DIR = args.userDataDir;
 const HEADLESS = Boolean(args.headless);
-const CREATE_BRANCHES = process.env.CREATE_BRANCHES === 'true' || args.createBranches || false;
-const SPACE = args.space?.toLowerCase();
+const MODEL = args.model?.toLowerCase();
 
-// Validate the project URL
-if (!PROJECT_URL || !PROJECT_URL.startsWith('http')) {
-  console.error('Error: Invalid project URL. Please provide a valid Builder.io project URL.');
-  console.error('Example: https://builder.io/app/projects/YOUR_PROJECT_ID/PROJECT_NAME');
-  process.exit(1);
-}
-
-console.log(`Project URL: ${PROJECT_URL}`);
 console.log(`Tabs: ${TABS}`);
-console.log(`Create Branches: ${CREATE_BRANCHES}`);
 console.log(`Headless: ${HEADLESS}`);
-console.log(`Space: ${SPACE}`);
-
-// Extract and display project information for debugging
-const urlParts = PROJECT_URL.split('/');
-const projectId = urlParts[urlParts.length - 2];
-const projectName = urlParts[urlParts.length - 1];
-console.log(`Project ID: ${projectId}`);
-console.log(`Project Name: ${projectName}`);
+console.log(`Model: ${MODEL}`);
+console.log(`Space: ILC (API Key: 51e45e690e6b4298bfdf7c4a3331edf6)`);
+console.log(`Load Testing: Creating ${TABS} new projects via main prompt interface`);
 
 // Heuristics for “project is ready”
 const READY_CHECKS = [
@@ -85,72 +99,27 @@ const PROMPT_CANDIDATES = [
 
 const PROMPT_TEXT = process.env.PROMPT_TEXT || "Generate a modern landing page design";
 
-// Function to create a new branch URL and navigate to it
-const createBranchUrl = (baseUrl, tabIndex) => {
-  // Generate a unique branch name
-  const branchName = `loadtest-tab-${tabIndex + 1}-${Date.now()}`;
-  
-  // Remove any existing branch from the URL and add the new branch
-  const urlParts = baseUrl.split('/');
-  const projectId = urlParts[urlParts.length - 2]; // Get project ID
-  const baseProjectUrl = urlParts.slice(0, -1).join('/'); // Remove last segment
-  
-  // Create the branch URL
-  const branchUrl = `${baseProjectUrl}/${branchName}`;
-  
-  console.log(`[tab ${tabIndex+1}] Generated branch URL: ${branchUrl}`);
-  return { branchUrl, branchName };
-};
-
-// Function to create a new branch using Builder's API/UI
-const createBranch = async (page, tabIndex, baseUrl) => {
+// Function to select AI model
+const selectModel = async (page, tabIndex, model) => {
   try {
-    console.log(`[tab ${tabIndex+1}] Creating new branch...`);
+    console.log(`[tab ${tabIndex+1}] Selecting AI model: ${model}`);
     
-    // First, try to navigate to the branch URL directly
-    // Builder might auto-create the branch if it doesn't exist
-    const { branchUrl, branchName } = createBranchUrl(baseUrl, tabIndex);
-    
-    try {
-      await page.goto(branchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      console.log(`[tab ${tabIndex+1}] Successfully navigated to branch: ${branchName}`);
-      return { success: true, branchName, branchUrl };
-    } catch (error) {
-      console.log(`[tab ${tabIndex+1}] Direct branch navigation failed, trying UI approach: ${error.message}`);
-    }
-    
-    // If direct navigation fails, try the UI approach
-    // Look for branch creation button/icon
-    const branchSelectors = [
-      'button[aria-label*="branch"]',
-      'button[title*="branch"]',
-      '[data-testid*="branch"]',
-      '[data-qa*="branch"]',
-      'button:has-text("Branch")',
-      'button:has-text("Create branch")',
-      'button:has-text("New branch")',
-      // Look for dropdown or menu that might contain branch options
-      'button[aria-haspopup="true"]',
-      'button[aria-expanded]',
-      // Look for plus icon or add button
-      'button[aria-label*="Add"]',
-      'button[title*="Add"]',
-      'button:has(svg)',
-      // Generic branch-related selectors
-      '[class*="branch"]',
-      '[class*="Branch"]'
+    // Try multiple selectors for the model dropdown button
+    const dropdownSelectors = [
+      'button[title="Select AI model"]',
+      'button:has-text("Sonnet")',
+      'button:has(svg.tabler-icon-chevron-down)',
+      'button[type="button"]:has(span:has-text("Sonnet"))',
+      'button:has(span:has(svg))'
     ];
     
-    let branchButton = null;
-    let usedSelector = '';
-    
-    for (const selector of branchSelectors) {
+    let modelDropdown = null;
+    for (const selector of dropdownSelectors) {
       try {
         const element = await page.locator(selector).first();
         if (await element.isVisible()) {
-          branchButton = element;
-          usedSelector = selector;
-          console.log(`[tab ${tabIndex+1}] Found branch button with selector: ${selector}`);
+          modelDropdown = element;
+          console.log(`[tab ${tabIndex+1}] Found model dropdown with selector: ${selector}`);
           break;
         }
       } catch (e) {
@@ -158,116 +127,89 @@ const createBranch = async (page, tabIndex, baseUrl) => {
       }
     }
     
-    if (branchButton) {
-      // Click the branch button
-      await branchButton.click();
+    if (modelDropdown) {
+      await modelDropdown.click();
       await page.waitForTimeout(1000);
+      console.log(`[tab ${tabIndex+1}] Opened model dropdown`);
       
-      // Look for "Create new branch" or similar option
-      const createBranchSelectors = [
-        'button:has-text("Create new branch")',
-        'button:has-text("New branch")',
-        'button:has-text("Create branch")',
-        '[data-testid*="create-branch"]',
-        '[data-qa*="create-branch"]',
-        'button[aria-label*="create"]',
-        'button[title*="create"]'
-      ];
+      // Select the specific model based on the model parameter
+      let modelSelector = '';
+      switch (model) {
+        case 'gpt-5-mini':
+          modelSelector = 'li[role="menuitem"]:has-text("GPT-5 Mini")';
+          break;
+        case 'gpt-5':
+          modelSelector = 'li[role="menuitem"]:has-text("GPT-5")';
+          break;
+        case 'claude-sonnet-4':
+          modelSelector = 'li[role="menuitem"]:has-text("Claude Sonnet 4")';
+          break;
+        case 'grok-code-fast':
+          modelSelector = 'li[role="menuitem"]:has-text("Grok Code Fast")';
+          break;
+        case 'auto':
+          modelSelector = 'li[role="menuitem"]:has-text("Auto")';
+          break;
+        default:
+          console.log(`[tab ${tabIndex+1}] Unknown model: ${model}, using GPT-5 Mini as fallback`);
+          modelSelector = 'li[role="menuitem"]:has-text("GPT-5 Mini")';
+      }
       
-      let createButton = null;
-      for (const selector of createBranchSelectors) {
+      // Click the model option
+      const modelOption = await page.locator(modelSelector).first();
+      if (await modelOption.isVisible()) {
+        await modelOption.click();
+        await page.waitForTimeout(500);
+        console.log(`[tab ${tabIndex+1}] Successfully selected model: ${model}`);
+        return true;
+      } else {
+        console.log(`[tab ${tabIndex+1}] Model option not found: ${model}`);
+        
+        // Debug: List available options
         try {
-          const element = await page.locator(selector).first();
-          if (await element.isVisible()) {
-            createButton = element;
-            console.log(`[tab ${tabIndex+1}] Found create branch button: ${selector}`);
-            break;
+          const allOptions = await page.locator('li[role="menuitem"]').all();
+          console.log(`[tab ${tabIndex+1}] Available model options:`);
+          for (let i = 0; i < Math.min(allOptions.length, 5); i++) {
+            try {
+              const text = await allOptions[i].textContent();
+              console.log(`[tab ${tabIndex+1}] Option ${i}: "${text?.trim()}"`);
+            } catch (e) {
+              console.log(`[tab ${tabIndex+1}] Could not read option ${i}`);
+            }
           }
         } catch (e) {
-          // Continue
+          console.log(`[tab ${tabIndex+1}] Could not list available options: ${e.message}`);
         }
+        return false;
       }
+    } else {
+      console.log(`[tab ${tabIndex+1}] Model dropdown not found with any selector`);
       
-      if (createButton) {
-        await createButton.click();
-        await page.waitForTimeout(1000);
-        
-        // Look for branch name input field
-        const nameInputSelectors = [
-          'input[placeholder*="branch"]',
-          'input[placeholder*="name"]',
-          'input[type="text"]',
-          'input:not([type="hidden"])',
-          '[contenteditable="true"]'
-        ];
-        
-        let nameInput = null;
-        for (const selector of nameInputSelectors) {
+      // Debug: Check what buttons are available
+      try {
+        const allButtons = await page.locator('button').all();
+        console.log(`[tab ${tabIndex+1}] Found ${allButtons.length} buttons on page`);
+        for (let i = 0; i < Math.min(allButtons.length, 5); i++) {
           try {
-            const element = await page.locator(selector).first();
-            if (await element.isVisible()) {
-              nameInput = element;
-              console.log(`[tab ${tabIndex+1}] Found name input: ${selector}`);
-              break;
-            }
+            const title = await allButtons[i].getAttribute('title');
+            const text = await allButtons[i].textContent();
+            console.log(`[tab ${tabIndex+1}] Button ${i}: title="${title}", text="${text?.trim()}"`);
           } catch (e) {
-            // Continue
+            console.log(`[tab ${tabIndex+1}] Could not inspect button ${i}`);
           }
         }
-        
-        if (nameInput) {
-          // Clear and type branch name
-          await nameInput.fill('');
-          await nameInput.type(branchName, { delay: 100 });
-          await page.waitForTimeout(500);
-          
-          // Look for create/confirm button
-          const confirmSelectors = [
-            'button:has-text("Create")',
-            'button:has-text("Confirm")',
-            'button:has-text("Save")',
-            'button[type="submit"]',
-            '[data-testid*="confirm"]',
-            '[data-qa*="confirm"]'
-          ];
-          
-          let confirmButton = null;
-          for (const selector of confirmSelectors) {
-            try {
-              const element = await page.locator(selector).first();
-              if (await element.isVisible()) {
-                confirmButton = element;
-                break;
-              }
-            } catch (e) {
-              // Continue
-            }
-          }
-          
-          if (confirmButton) {
-            await confirmButton.click();
-            await page.waitForTimeout(2000);
-            console.log(`[tab ${tabIndex+1}] Successfully created branch via UI: ${branchName}`);
-            return { success: true, branchName, branchUrl };
-          } else {
-            // Try pressing Enter as fallback
-            await nameInput.press('Enter');
-            await page.waitForTimeout(2000);
-            console.log(`[tab ${tabIndex+1}] Created branch via Enter key: ${branchName}`);
-            return { success: true, branchName, branchUrl };
-          }
-        }
+      } catch (e) {
+        console.log(`[tab ${tabIndex+1}] Could not inspect buttons: ${e.message}`);
       }
+      return false;
     }
-    
-    console.log(`[tab ${tabIndex+1}] Could not find branch creation interface`);
-    return { success: false, branchName: null, branchUrl: null };
-    
   } catch (error) {
-    console.log(`[tab ${tabIndex+1}] Error creating branch: ${error.message}`);
-    return { success: false, branchName: null, branchUrl: null };
+    console.log(`[tab ${tabIndex+1}] Error selecting model: ${error.message}`);
+    return false;
   }
 };
+
+
 
 (async () => {
   const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
@@ -295,39 +237,24 @@ const createBranch = async (page, tabIndex, baseUrl) => {
   // 1) Open dashboard to ensure session is "warmed" and navigate to correct space
   const dash = await browser.newPage();
   
-  // Navigate to the correct space based on user preference or project URL
-  if (SPACE === 'ilc' || (SPACE === 'auto' && PROJECT_URL.includes('27584ede79c245538e7204704ba66afe'))) {
-    console.log('Navigating to ILC space...');
-    try {
-      await dash.goto('https://builder.io/app/projects/27584ede79c245538e7204704ba66afe', { waitUntil: 'load', timeout: 120_000 });
-      console.log('Successfully navigated to ILC space');
-    } catch (error) {
-      console.log('ILC space navigation failed, falling back to general dashboard:', error.message);
-      await dash.goto('https://builder.io/projects', { waitUntil: 'load', timeout: 120_000 });
-    }
-  } else if (SPACE === 'tlf' || (SPACE === 'auto' && PROJECT_URL.includes('550d0ae46a844dae867aa46ee33c7048'))) {
-    console.log('Navigating to TLF space...');
-    try {
-      await dash.goto('https://builder.io/app/projects/550d0ae46a844dae867aa46ee33c7048', { waitUntil: 'load', timeout: 120_000 });
-      console.log('Successfully navigated to TLF space');
-    } catch (error) {
-      console.log('TLF space navigation failed, falling back to general dashboard:', error.message);
-      await dash.goto('https://builder.io/projects', { waitUntil: 'load', timeout: 120_000 });
-    }
-  } else {
-    console.log('Navigating to general Builder.io dashboard...');
-    await dash.goto('https://builder.io/projects', { waitUntil: 'load', timeout: 120_000 });
+  // Navigate to main projects page to use the main prompt interface
+  console.log('Navigating to main projects page (ILC space - API key: 51e45e690e6b4298bfdf7c4a3331edf6)...');
+  try {
+    await dash.goto('https://builder.io/app/projects', { waitUntil: 'load', timeout: 120_000 });
+    console.log('Successfully navigated to main projects page');
+  } catch (error) {
+    console.log('Main projects page navigation failed:', error.message);
+    throw error;
   }
   
   // Don't block forever if SSO login shows—give the user a moment to complete it.
   // If not authenticated, the next steps will fail with helpful errors.
 
-  // 2) Open N tabs of the specific project with batching for large-scale operations
+  // 2) Open N tabs of the main projects page for creating new projects
   const pages = [];
-  const branchUrls = [];
   const BATCH_SIZE = Math.min(10, TABS); // Process tabs in batches of 10 to prevent overwhelming
   
-  console.log(`Opening ${TABS} tabs in batches of ${BATCH_SIZE}...`);
+  console.log(`Opening ${TABS} tabs to main projects page in batches of ${BATCH_SIZE}...`);
   
   for (let batchStart = 0; batchStart < TABS; batchStart += BATCH_SIZE) {
     const batchEnd = Math.min(batchStart + BATCH_SIZE, TABS);
@@ -340,41 +267,15 @@ const createBranch = async (page, tabIndex, baseUrl) => {
     for (let i = batchStart; i < batchEnd; i++) {
       const p = await browser.newPage();
       
-      if (CREATE_BRANCHES) {
-        // Create a unique branch URL for this tab
-        const { branchUrl, branchName } = createBranchUrl(PROJECT_URL, i);
-        branchUrls.push({ branchUrl, branchName });
-        
-        // Navigate directly to the branch URL
-        try {
-          await p.goto(branchUrl, { waitUntil: 'domcontentloaded', timeout: 120_000 });
-          console.log(`[tab ${i+1}/${TABS}] Navigated to branch: ${branchName}`);
-        } catch (error) {
-          console.log(`[tab ${i+1}/${TABS}] Branch navigation failed, falling back to main: ${error.message}`);
-          // Fallback to main project URL
-          const cacheBust = (PROJECT_URL.includes('?') ? '&' : '?') + `loadtest=${crypto.randomUUID()}&i=${i+1}`;
-          try {
-            await p.goto(PROJECT_URL + cacheBust, { waitUntil: 'domcontentloaded', timeout: 120_000 });
-            console.log(`[tab ${i+1}/${TABS}] Successfully navigated to main project`);
-          } catch (mainError) {
-            console.error(`[tab ${i+1}/${TABS}] CRITICAL: Failed to navigate to main project: ${mainError.message}`);
-            console.error(`[tab ${i+1}/${TABS}] This suggests the project URL is invalid or you don't have access to it.`);
-            console.error(`[tab ${i+1}/${TABS}] Please verify the project URL and your permissions.`);
-            throw mainError;
-          }
-        }
-      } else {
-        // Use main project URL with cache busting
-        const cacheBust = (PROJECT_URL.includes('?') ? '&' : '?') + `loadtest=${crypto.randomUUID()}&i=${i+1}`;
-        try {
-          await p.goto(PROJECT_URL + cacheBust, { waitUntil: 'domcontentloaded', timeout: 120_000 });
-          console.log(`[tab ${i+1}/${TABS}] Successfully navigated to main project`);
-        } catch (error) {
-          console.error(`[tab ${i+1}/${TABS}] CRITICAL: Failed to navigate to project: ${error.message}`);
-          console.error(`[tab ${i+1}/${TABS}] This suggests the project URL is invalid or you don't have access to it.`);
-          console.error(`[tab ${i+1}/${TABS}] Please verify the project URL and your permissions.`);
-          throw error;
-        }
+      // Navigate to main projects page with cache busting to ensure fresh sessions
+      const cacheBust = `?loadtest=${crypto.randomUUID()}&i=${i+1}`;
+      try {
+        await p.goto('https://builder.io/app/projects' + cacheBust, { waitUntil: 'domcontentloaded', timeout: 120_000 });
+        console.log(`[tab ${i+1}/${TABS}] Successfully navigated to main projects page`);
+      } catch (error) {
+        console.error(`[tab ${i+1}/${TABS}] CRITICAL: Failed to navigate to main projects page: ${error.message}`);
+        console.error(`[tab ${i+1}/${TABS}] This suggests authentication issues or network problems.`);
+        throw error;
       }
       
       pages.push(p);
@@ -422,155 +323,93 @@ const createBranch = async (page, tabIndex, baseUrl) => {
     }
   }));
 
-  // 4) Trigger "prompt" across all tabs
+  // 4) Create new projects using the main prompt interface
   const triggerOnPage = async (p, idx) => {
-    console.log(`[tab ${idx+1}] Starting prompt injection...`);
+    console.log(`[tab ${idx+1}] Starting new project creation...`);
     
-    // Wait a bit more for the interface to fully load
+    // Wait for the main prompt interface to fully load
     await p.waitForTimeout(5000);
     
-    // First, try to find and fill the prompt input field
     try {
-      console.log(`[tab ${idx+1}] Looking for prompt input field...`);
-      
-      // Try multiple selectors with better specificity - prioritize the actual prompt input
-      const selectors = [
-        // Target the ProseMirror contenteditable div first (the actual prompt input)
-        'div[contenteditable="true"][role="textbox"]',
-        'div.tiptap.ProseMirror',
-        'div[class*="ProseMirror"]',
-        // Then try the editor-empty-node class
-        '.editor-empty-node.editor-empty',
-        // Then try placeholder-based selectors
-        'input[placeholder*="Ask"]',
-        'textarea[placeholder*="Ask"]',
-        'input[placeholder*="Fusion"]',
-        'textarea[placeholder*="Fusion"]',
-        '[placeholder*="Ask"]',
-        '[placeholder*="Fusion"]',
-        // Fallback to data attributes
-        '[data-testid*="prompt"]',
-        '[data-qa*="prompt"]',
-        '[data-testid*="input"]',
-        '[data-qa*="input"]',
-        // Generic fallbacks last
-        'input[type="text"]',
-        'textarea',
-        'input'
-      ];
-      
-      let promptInput = null;
-      let usedSelector = '';
-      
-      for (const selector of selectors) {
-        try {
-          const element = await p.locator(selector).first();
-          if (await element.isVisible()) {
-            promptInput = element;
-            usedSelector = selector;
-            console.log(`[tab ${idx+1}] Found input field with selector: ${selector}`);
-            break;
-          }
-        } catch (e) {
-          // Continue to next selector
-        }
+      // First, select the AI model
+      const modelSelected = await selectModel(p, idx, MODEL);
+      if (!modelSelected) {
+        console.log(`[tab ${idx+1}] Model selection failed, continuing with default model`);
       }
       
-      if (promptInput) {
-        // Wait for element to be fully interactive
-        await promptInput.waitFor({ state: 'visible', timeout: 10000 });
+      console.log(`[tab ${idx+1}] Looking for main prompt input field...`);
+      
+      // Target the specific ProseMirror contenteditable div from the main projects page
+      const promptInput = await p.locator('div[contenteditable="true"][role="textbox"].tiptap.ProseMirror').first();
+      
+      if (await promptInput.isVisible()) {
+        console.log(`[tab ${idx+1}] Found main prompt input field`);
         
-        // Additional verification - make sure this is the right input field
-        try {
-          const placeholder = await promptInput.getAttribute('placeholder');
-          const className = await promptInput.getAttribute('class');
-          console.log(`[tab ${idx+1}] Found input - placeholder: "${placeholder}", class: "${className}"`);
-          
-          // If this looks like a branch name input, skip it
-          if (placeholder && (placeholder.includes('branch') || placeholder.includes('Branch'))) {
-            console.log(`[tab ${idx+1}] Skipping branch name input, looking for prompt input...`);
-            return false; // This will trigger the fallback logic
-          }
-        } catch (e) {
-          console.log(`[tab ${idx+1}] Could not inspect input attributes: ${e.message}`);
-        }
+        // Click to focus the contenteditable div
+        await promptInput.click();
+        await p.waitForTimeout(500);
         
-        // Handle contenteditable divs differently than regular inputs
-        if (usedSelector.includes('contenteditable') || usedSelector.includes('ProseMirror')) {
-          console.log(`[tab ${idx+1}] Detected contenteditable div, using click + type approach`);
-          
-          // Click to focus the contenteditable div
-          await promptInput.click();
-          await p.waitForTimeout(500);
-          
-          // Type the text directly into the contenteditable div
-          await promptInput.type(PROMPT_TEXT, { delay: 150 });
-          
-          // Wait a moment for the text to be fully typed
-          await p.waitForTimeout(1000);
-          
-          // For contenteditable divs, we might need to trigger the submit differently
-          // Try pressing Enter first
-          await promptInput.press('Enter');
-          
-          // If Enter doesn't work, try clicking a submit button
-          await p.waitForTimeout(1000);
-          try {
-            const submitButton = await p.locator('button[type="submit"], [role="button"]:has-text("Send"), [data-testid*="submit"], [data-qa*="submit"]').first();
-            if (await submitButton.isVisible()) {
-              await submitButton.click();
-              console.log(`[tab ${idx+1}] Clicked submit button after typing`);
-            }
-          } catch (e) {
-            console.log(`[tab ${idx+1}] No submit button found, relying on Enter key`);
+        // Type the prompt text to create a new project
+        await promptInput.type(PROMPT_TEXT, { delay: 150 });
+        
+        // Wait for text to be fully typed
+        await p.waitForTimeout(1000);
+        
+        // Look for the send button with the specific selector
+        const sendButton = await p.locator('button[type="button"][title="Send message"]').first();
+        
+        if (await sendButton.isVisible()) {
+          // Check if button is enabled (not disabled)
+          const isDisabled = await sendButton.getAttribute('disabled');
+          if (!isDisabled) {
+            await sendButton.click();
+            console.log(`[tab ${idx+1}] Successfully clicked send button to create new project`);
+            return true;
+          } else {
+            console.log(`[tab ${idx+1}] Send button is disabled, trying Enter key instead`);
+            await promptInput.press('Enter');
+            console.log(`[tab ${idx+1}] Pressed Enter to submit prompt`);
+            return true;
           }
         } else {
-          // Handle regular input fields as before
-          await promptInput.fill('');
-          await promptInput.type(PROMPT_TEXT, { delay: 150 });
-          
-          // Wait a moment for the text to be fully typed
-          await p.waitForTimeout(1000);
-          
-          // Try to submit by pressing Enter
+          console.log(`[tab ${idx+1}] Send button not found, trying Enter key`);
           await promptInput.press('Enter');
+          console.log(`[tab ${idx+1}] Pressed Enter to submit prompt`);
+          return true;
         }
-        
-        console.log(`[tab ${idx+1}] Successfully submitted prompt: "${PROMPT_TEXT}" using selector: ${usedSelector}`);
-        return true;
       } else {
-        console.log(`[tab ${idx+1}] No input field found with any selector`);
+        console.log(`[tab ${idx+1}] Main prompt input field not found`);
         
-        // Debug: Let's see what elements are actually on the page
+        // Debug: Check what's actually on the page
         try {
-          const allInputs = await p.locator('input, textarea').all();
-          console.log(`[tab ${idx+1}] Found ${allInputs.length} input/textarea elements`);
+          const allContentEditable = await p.locator('[contenteditable="true"]').all();
+          console.log(`[tab ${idx+1}] Found ${allContentEditable.length} contenteditable elements`);
           
-          for (let i = 0; i < Math.min(allInputs.length, 5); i++) {
+          for (let i = 0; i < Math.min(allContentEditable.length, 3); i++) {
             try {
-              const placeholder = await allInputs[i].getAttribute('placeholder');
-              const type = await allInputs[i].getAttribute('type');
-              const visible = await allInputs[i].isVisible();
-              console.log(`[tab ${idx+1}] Input ${i}: type=${type}, placeholder="${placeholder}", visible=${visible}`);
+              const className = await allContentEditable[i].getAttribute('class');
+              const role = await allContentEditable[i].getAttribute('role');
+              const visible = await allContentEditable[i].isVisible();
+              console.log(`[tab ${idx+1}] ContentEditable ${i}: class="${className}", role="${role}", visible=${visible}`);
             } catch (e) {
-              console.log(`[tab ${idx+1}] Could not inspect input ${i}: ${e.message}`);
+              console.log(`[tab ${idx+1}] Could not inspect contenteditable ${i}: ${e.message}`);
             }
           }
         } catch (e) {
-          console.log(`[tab ${idx+1}] Could not inspect inputs: ${e.message}`);
+          console.log(`[tab ${idx+1}] Could not inspect contenteditable elements: ${e.message}`);
         }
       }
     } catch (error) {
-      console.log(`[tab ${idx+1}] Error finding prompt input field: ${error.message}`);
+      console.log(`[tab ${idx+1}] Error with main prompt interface: ${error.message}`);
     }
 
-    // If user provided a selector override, use that first (fallback to original behavior)
+    // If user provided a selector override, use that as fallback
     if (PROMPT_SELECTOR_OVERRIDE) {
       try {
         const ok = await p.$(PROMPT_SELECTOR_OVERRIDE);
         if (ok && await ok.isVisible()) {
           await ok.click({ timeout: 15_000 });
-          console.log(`[tab ${idx+1}] Prompt via override selector.`);
+          console.log(`[tab ${idx+1}] Used override selector for prompt.`);
           return true;
         }
       } catch (e) {
@@ -578,41 +417,7 @@ const createBranch = async (page, tabIndex, baseUrl) => {
       }
     }
 
-    // Try heuristics
-    // a) role=button name=/prompt/i
-    try {
-      const btn = await p.getByRole('button', { name: /prompt/i }).first();
-      if (await btn.isVisible()) {
-        await btn.click({ timeout: 15_000 });
-        console.log(`[tab ${idx+1}] Prompt via role=button name=/prompt/i`);
-        return true;
-      }
-    } catch {}
-
-    // b) any element with visible text “Prompt”
-    try {
-      const textBtn = await p.getByText(/^\s*prompt\s*$/i, { exact: false }).first();
-      if (await textBtn.isVisible()) {
-        await textBtn.click({ timeout: 15_000 });
-        console.log(`[tab ${idx+1}] Prompt via text=Prompt`);
-        return true;
-      }
-    } catch {}
-
-    // c) data-testid/data-qa
-    try {
-      const cssBtn = await p.locator('[data-testid="prompt"], [data-qa="prompt"]').first();
-      if (await cssBtn.isVisible()) {
-        await cssBtn.click({ timeout: 15_000 });
-        console.log(`[tab ${idx+1}] Prompt via data-testid/data-qa`);
-        return true;
-      }
-    } catch {}
-
-    // d) Fallback: try a keyboard shortcut if your app supports one (uncomment & set)
-    // await p.keyboard.press('Control+Shift+P');
-
-    console.warn(`[tab ${idx+1}] Could not find a “prompt” control. Consider --promptSelector ".my-selector"`);
+    console.warn(`[tab ${idx+1}] Could not find the main prompt interface. Make sure you're on the correct page.`);
     return false;
   };
 
