@@ -1,17 +1,28 @@
 #!/usr/bin/env node
 /**
  * Usage examples:
- *   node burst-builder.js --tabs 5
- *   node burst-builder.js --tabs 10 --headless
- *   node burst-builder.js --tabs 20 --model gpt-5
- *   node burst-builder.js --tabs 5 --model claude-sonnet-4 --headless
+ *   # First time setup (UI mode required for login)
+ *   node burst-builder.js --tabs 1
+ *   
+ *   # Subsequent runs (can use headless mode)
+ *   node burst-builder.js --tabs 5 --headless
+ *   node burst-builder.js --tabs 10 --model gpt-5 --headless
+ *   node burst-builder.js --tabs 20 --model claude-sonnet-4
  *
  * What it does:
- *  1) Opens https://builder.io/app/projects (main projects page) so your session/cookies load.
- *  2) Opens N tabs of the main projects page.
- *  3) Selects the specified AI model from the dropdown.
- *  4) Uses the main prompt interface to create new projects by submitting prompts.
- *  5) Each tab creates a separate new project, providing true load testing.
+ *  1) Opens https://builder.io/app/projects (main projects page)
+ *  2) Checks authentication status and handles login if needed
+ *  3) Opens N tabs of the main projects page
+ *  4) Selects the specified AI model from the dropdown
+ *  5) Uses the main prompt interface to create new projects by submitting prompts
+ *  6) Each tab creates a separate new project, providing true load testing
+ *
+ * Authentication Flow:
+ *  - Automatically detects if login is required
+ *  - In UI mode: Waits for user to complete login (up to 5 minutes)
+ *  - In headless mode: Requires previous successful login, exits with helpful error
+ *  - Validates authentication on each tab to ensure success
+ *  - Uses persistent browser context to maintain login sessions
  *
  * Load Testing Approach:
  *  - Creates multiple NEW projects instead of opening the same project multiple times
@@ -28,7 +39,7 @@
  *
  * Available Parameters:
  *  --tabs: Number of tabs to open (default: 5, max: 55)
- *  --headless: Run browser in headless mode
+ *  --headless: Run browser in headless mode (requires previous login)
  *  --model: AI model to use (default: gpt-5-mini)
  *    Options: gpt-5-mini, gpt-5, claude-sonnet-4, grok-code-fast, auto
  *  --promptSelector: Custom selector for prompt button (fallback)
@@ -41,11 +52,15 @@
  *  - grok-code-fast: Quality B, Cost 0.1x (fast)
  *  - auto: Automatic selection (currently: Claude Sonnet 4)
  *
+ * First Time Setup:
+ *  1. Run: node burst-builder.js --tabs 1
+ *  2. Complete login in the browser window when prompted
+ *  3. After successful login, you can use --headless for subsequent runs
+ *
  * Assumptions:
- *  - You're already signed in to Builder in Chrome. This script starts a persistent context
- *    so you can reuse the same session between runs (see USER_DATA_DIR).
- *  - The main prompt interface is available on the projects page.
- *  - Each prompt submission will create a new project.
+ *  - The main prompt interface is available on the projects page
+ *  - Each prompt submission will create a new project
+ *  - Browser user data is persisted in USER_DATA_DIR for session management
  */
 
 const { chromium } = require('playwright');
@@ -98,6 +113,125 @@ const PROMPT_CANDIDATES = [
 ];
 
 const PROMPT_TEXT = process.env.PROMPT_TEXT || "Generate a modern landing page design";
+
+// Function to check if user is authenticated
+const checkAuthentication = async (page, tabIndex) => {
+  try {
+    console.log(`[tab ${tabIndex+1}] Checking authentication status...`);
+    
+    // Wait for page to load
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+    
+    // Check for common authentication indicators
+    const authIndicators = [
+      // Look for login/signin buttons (indicates not authenticated)
+      'button:has-text("Sign in")',
+      'button:has-text("Login")',
+      'button:has-text("Log in")',
+      'a:has-text("Sign in")',
+      'a:has-text("Login")',
+      'a:has-text("Log in")',
+      // Look for user profile/account indicators (indicates authenticated)
+      '[data-testid*="user"]',
+      '[data-testid*="profile"]',
+      '[data-testid*="account"]',
+      'button[aria-label*="user"]',
+      'button[aria-label*="profile"]',
+      'button[aria-label*="account"]',
+      // Look for the main prompt interface (indicates authenticated)
+      'div[contenteditable="true"][role="textbox"].tiptap.ProseMirror',
+      'button[title="Select AI model"]'
+    ];
+    
+    // Check for unauthenticated indicators first
+    for (const selector of authIndicators.slice(0, 6)) {
+      try {
+        const element = await page.locator(selector).first();
+        if (await element.isVisible()) {
+          console.log(`[tab ${tabIndex+1}] Found login prompt: ${selector}`);
+          return { authenticated: false, reason: 'login_required' };
+        }
+      } catch (e) {
+        // Continue checking
+      }
+    }
+    
+    // Check for authenticated indicators
+    for (const selector of authIndicators.slice(6)) {
+      try {
+        const element = await page.locator(selector).first();
+        if (await element.isVisible()) {
+          console.log(`[tab ${tabIndex+1}] Found authenticated indicator: ${selector}`);
+          return { authenticated: true, reason: 'authenticated' };
+        }
+      } catch (e) {
+        // Continue checking
+      }
+    }
+    
+    // If we can't determine, assume not authenticated for safety
+    console.log(`[tab ${tabIndex+1}] Could not determine authentication status, assuming not authenticated`);
+    return { authenticated: false, reason: 'unknown' };
+    
+  } catch (error) {
+    console.log(`[tab ${tabIndex+1}] Error checking authentication: ${error.message}`);
+    return { authenticated: false, reason: 'error' };
+  }
+};
+
+// Function to handle authentication flow
+const handleAuthentication = async (page, tabIndex) => {
+  try {
+    console.log(`[tab ${tabIndex+1}] Starting authentication flow...`);
+    
+    // Check current authentication status
+    const authStatus = await checkAuthentication(page, tabIndex);
+    
+    if (authStatus.authenticated) {
+      console.log(`[tab ${tabIndex+1}] Already authenticated, proceeding with load test`);
+      return { success: true, authenticated: true };
+    }
+    
+    console.log(`[tab ${tabIndex+1}] Authentication required: ${authStatus.reason}`);
+    
+    // If in headless mode, we can't handle interactive login
+    if (HEADLESS) {
+      console.error(`[tab ${tabIndex+1}] ERROR: Authentication required but running in headless mode.`);
+      console.error(`[tab ${tabIndex+1}] Please run without --headless flag first to complete login:`);
+      console.error(`[tab ${tabIndex+1}]   node burst-builder.js --tabs 1`);
+      console.error(`[tab ${tabIndex+1}] After successful login, you can use --headless for subsequent runs.`);
+      return { success: false, authenticated: false, reason: 'headless_login_required' };
+    }
+    
+    // In UI mode, wait for user to complete login
+    console.log(`[tab ${tabIndex+1}] Please complete login in the browser window...`);
+    console.log(`[tab ${tabIndex+1}] Waiting for authentication to complete...`);
+    
+    // Wait for authentication to complete (poll every 5 seconds for up to 5 minutes)
+    const maxWaitTime = 5 * 60 * 1000; // 5 minutes
+    const pollInterval = 5000; // 5 seconds
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < maxWaitTime) {
+      await page.waitForTimeout(pollInterval);
+      
+      const currentAuthStatus = await checkAuthentication(page, tabIndex);
+      if (currentAuthStatus.authenticated) {
+        console.log(`[tab ${tabIndex+1}] Authentication completed successfully!`);
+        return { success: true, authenticated: true };
+      }
+      
+      console.log(`[tab ${tabIndex+1}] Still waiting for authentication... (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
+    }
+    
+    console.error(`[tab ${tabIndex+1}] Authentication timeout after 5 minutes`);
+    return { success: false, authenticated: false, reason: 'timeout' };
+    
+  } catch (error) {
+    console.log(`[tab ${tabIndex+1}] Error in authentication flow: ${error.message}`);
+    return { success: false, authenticated: false, reason: 'error' };
+  }
+};
 
 // Function to select AI model
 const selectModel = async (page, tabIndex, model) => {
@@ -234,7 +368,7 @@ const selectModel = async (page, tabIndex, model) => {
     ]
   });
 
-  // 1) Open dashboard to ensure session is "warmed" and navigate to correct space
+  // 1) Open dashboard to ensure session is "warmed" and handle authentication
   const dash = await browser.newPage();
   
   // Navigate to main projects page to use the main prompt interface
@@ -247,10 +381,28 @@ const selectModel = async (page, tabIndex, model) => {
     throw error;
   }
   
-  // Don't block forever if SSO login shows—give the user a moment to complete it.
-  // If not authenticated, the next steps will fail with helpful errors.
+  // 2) Handle authentication flow
+  console.log('\n=== AUTHENTICATION CHECK ===');
+  const authResult = await handleAuthentication(dash, 0);
+  
+  if (!authResult.success) {
+    if (authResult.reason === 'headless_login_required') {
+      console.error('\n❌ AUTHENTICATION FAILED: Cannot complete login in headless mode');
+      console.error('Please run the following command first to complete login:');
+      console.error('  node burst-builder.js --tabs 1');
+      console.error('After successful login, you can use --headless for subsequent runs.');
+      await browser.close();
+      process.exit(1);
+    } else {
+      console.error(`\n❌ AUTHENTICATION FAILED: ${authResult.reason}`);
+      await browser.close();
+      process.exit(1);
+    }
+  }
+  
+  console.log('✅ Authentication successful, proceeding with load test...\n');
 
-  // 2) Open N tabs of the main projects page for creating new projects
+  // 3) Open N tabs of the main projects page for creating new projects
   const pages = [];
   const BATCH_SIZE = Math.min(10, TABS); // Process tabs in batches of 10 to prevent overwhelming
   
@@ -272,6 +424,15 @@ const selectModel = async (page, tabIndex, model) => {
       try {
         await p.goto('https://builder.io/app/projects' + cacheBust, { waitUntil: 'domcontentloaded', timeout: 120_000 });
         console.log(`[tab ${i+1}/${TABS}] Successfully navigated to main projects page`);
+        
+        // Quick authentication check for this tab
+        const tabAuthStatus = await checkAuthentication(p, i);
+        if (!tabAuthStatus.authenticated) {
+          console.warn(`[tab ${i+1}/${TABS}] WARNING: Tab may not be authenticated (${tabAuthStatus.reason})`);
+          console.warn(`[tab ${i+1}/${TABS}] This tab may fail during project creation`);
+        } else {
+          console.log(`[tab ${i+1}/${TABS}] Tab authentication confirmed`);
+        }
       } catch (error) {
         console.error(`[tab ${i+1}/${TABS}] CRITICAL: Failed to navigate to main projects page: ${error.message}`);
         console.error(`[tab ${i+1}/${TABS}] This suggests authentication issues or network problems.`);
@@ -290,7 +451,7 @@ const selectModel = async (page, tabIndex, model) => {
     }
   }
 
-  // 3) Wait for each tab to be "ready"
+  // 4) Wait for each tab to be "ready"
   await Promise.all(pages.map(async (p) => {
     await p.waitForLoadState('domcontentloaded', { timeout: 120_000 });
     // Custom "ready" poll in page context
@@ -323,7 +484,7 @@ const selectModel = async (page, tabIndex, model) => {
     }
   }));
 
-  // 4) Create new projects using the main prompt interface
+  // 5) Create new projects using the main prompt interface
   const triggerOnPage = async (p, idx) => {
     console.log(`[tab ${idx+1}] Starting new project creation...`);
     
