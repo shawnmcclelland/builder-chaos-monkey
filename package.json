@@ -1,0 +1,41 @@
+{
+  "name": "builder-burst",
+  "version": "1.0.0",
+  "description": "Multi-tab Builder.io load testing tool for parallel AI content generation",
+  "main": "burst-builder.js",
+  "bin": {
+    "builder-burst": "./burst-builder.js"
+  },
+  "scripts": {
+    "start": "node burst-builder.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "keywords": [
+    "builder.io",
+    "load-testing",
+    "automation",
+    "playwright",
+    "ai",
+    "content-generation",
+    "testing",
+    "performance"
+  ],
+  "author": "smcclelland1",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "minimist": "^1.2.8",
+    "playwright": "^1.55.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smcclelland1/builder-chaos-monkey.git"
+  },
+  "bugs": {
+    "url": "https://github.com/smcclelland1/builder-chaos-monkey/issues"
+  },
+  "homepage": "https://github.com/smcclelland1/builder-chaos-monkey#readme"
+}
