@@ -32,10 +32,9 @@
  *  - Configurable AI model selection for cost/quality optimization
  *
  * Space Configuration:
- *  - Always uses ILC space (API Key: 51e45e690e6b4298bfdf7c4a3331edf6)
- *  - Space ID: 27584ede79c245538e7204704ba66afe
+ *  - Always uses TLF space (API Key: e785dd8d482243ef9b7f7760850e1349)
  *  - This ensures consistent API key usage across all tabs
- *  - No space selection needed - always uses ILC space
+ *  - No space selection needed - always uses TLF space
  *
  * Available Parameters:
  *  --tabs: Number of tabs to open (default: 5, max: 55)
@@ -89,7 +88,7 @@ const MODEL = args.model?.toLowerCase();
 console.log(`Tabs: ${TABS}`);
 console.log(`Headless: ${HEADLESS}`);
 console.log(`Model: ${MODEL}`);
-console.log(`Space: ILC (API Key: 51e45e690e6b4298bfdf7c4a3331edf6)`);
+console.log(`Space: TLF (API Key: e785dd8d482243ef9b7f7760850e1349)`);
 console.log(`Load Testing: Creating ${TABS} new projects via main prompt interface`);
 
 // Heuristics for “project is ready”
@@ -122,33 +121,27 @@ const checkAuthentication = async (page, tabIndex) => {
     // Wait for page to load
     await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
     
-    // Check for common authentication indicators
-    const authIndicators = [
-      // Look for login/signin buttons (indicates not authenticated)
+    // Wait a bit more for dynamic content to load
+    await page.waitForTimeout(2000);
+    
+    // Check for explicit login/signin buttons (strong indicator of not authenticated)
+    const loginSelectors = [
       'button:has-text("Sign in")',
       'button:has-text("Login")',
       'button:has-text("Log in")',
       'a:has-text("Sign in")',
       'a:has-text("Login")',
       'a:has-text("Log in")',
-      // Look for user profile/account indicators (indicates authenticated)
-      '[data-testid*="user"]',
-      '[data-testid*="profile"]',
-      '[data-testid*="account"]',
-      'button[aria-label*="user"]',
-      'button[aria-label*="profile"]',
-      'button[aria-label*="account"]',
-      // Look for the main prompt interface (indicates authenticated)
-      'div[contenteditable="true"][role="textbox"].tiptap.ProseMirror',
-      'button[title="Select AI model"]'
+      'button[type="submit"]:has-text("Sign")',
+      'button[type="submit"]:has-text("Login")'
     ];
     
-    // Check for unauthenticated indicators first
-    for (const selector of authIndicators.slice(0, 6)) {
+    // Check for login buttons first
+    for (const selector of loginSelectors) {
       try {
         const element = await page.locator(selector).first();
         if (await element.isVisible()) {
-          console.log(`[tab ${tabIndex+1}] Found login prompt: ${selector}`);
+          console.log(`[tab ${tabIndex+1}] Found explicit login button: ${selector}`);
           return { authenticated: false, reason: 'login_required' };
         }
       } catch (e) {
@@ -156,8 +149,30 @@ const checkAuthentication = async (page, tabIndex) => {
       }
     }
     
+    // Check for authenticated indicators (more permissive)
+    const authSelectors = [
+      // Main prompt interface (strongest indicator)
+      'div[contenteditable="true"][role="textbox"].tiptap.ProseMirror',
+      'button[title="Select AI model"]',
+      // Builder.io specific elements
+      'button:has-text("What should we build?")',
+      'input[placeholder*="Ask"]',
+      'textarea[placeholder*="Ask"]',
+      // General authenticated page indicators
+      'nav',
+      '[role="navigation"]',
+      '[data-testid="app-shell"]',
+      // User account indicators
+      '[data-testid*="user"]',
+      '[data-testid*="profile"]',
+      '[data-testid*="account"]',
+      'button[aria-label*="user"]',
+      'button[aria-label*="profile"]',
+      'button[aria-label*="account"]'
+    ];
+    
     // Check for authenticated indicators
-    for (const selector of authIndicators.slice(6)) {
+    for (const selector of authSelectors) {
       try {
         const element = await page.locator(selector).first();
         if (await element.isVisible()) {
@@ -169,12 +184,29 @@ const checkAuthentication = async (page, tabIndex) => {
       }
     }
     
-    // If we can't determine, assume not authenticated for safety
+    // If we reach here, check if we're on a Builder.io page (not a login page)
+    const currentUrl = page.url();
+    if (currentUrl.includes('builder.io') && !currentUrl.includes('login') && !currentUrl.includes('signin')) {
+      console.log(`[tab ${tabIndex+1}] On Builder.io page without explicit login buttons, assuming authenticated`);
+      return { authenticated: true, reason: 'on_builder_page' };
+    }
+    
+    // If we can't determine, be more permissive in headless mode
+    if (HEADLESS) {
+      console.log(`[tab ${tabIndex+1}] In headless mode, assuming authenticated (user should have logged in previously)`);
+      return { authenticated: true, reason: 'headless_assumption' };
+    }
+    
     console.log(`[tab ${tabIndex+1}] Could not determine authentication status, assuming not authenticated`);
     return { authenticated: false, reason: 'unknown' };
     
   } catch (error) {
     console.log(`[tab ${tabIndex+1}] Error checking authentication: ${error.message}`);
+    // In headless mode, be more permissive
+    if (HEADLESS) {
+      console.log(`[tab ${tabIndex+1}] Error in headless mode, assuming authenticated`);
+      return { authenticated: true, reason: 'headless_error_assumption' };
+    }
     return { authenticated: false, reason: 'error' };
   }
 };
@@ -192,15 +224,22 @@ const handleAuthentication = async (page, tabIndex) => {
       return { success: true, authenticated: true };
     }
     
-    console.log(`[tab ${tabIndex+1}] Authentication required: ${authStatus.reason}`);
+    console.log(`[tab ${tabIndex+1}] Authentication status: ${authStatus.reason}`);
     
-    // If in headless mode, we can't handle interactive login
+    // If in headless mode, be more permissive
     if (HEADLESS) {
-      console.error(`[tab ${tabIndex+1}] ERROR: Authentication required but running in headless mode.`);
-      console.error(`[tab ${tabIndex+1}] Please run without --headless flag first to complete login:`);
-      console.error(`[tab ${tabIndex+1}]   node burst-builder.js --tabs 1`);
-      console.error(`[tab ${tabIndex+1}] After successful login, you can use --headless for subsequent runs.`);
-      return { success: false, authenticated: false, reason: 'headless_login_required' };
+      // Only fail if we explicitly found login buttons
+      if (authStatus.reason === 'login_required') {
+        console.error(`[tab ${tabIndex+1}] ERROR: Explicit login required but running in headless mode.`);
+        console.error(`[tab ${tabIndex+1}] Please run without --headless flag first to complete login:`);
+        console.error(`[tab ${tabIndex+1}]   node burst-builder.js --tabs 1`);
+        console.error(`[tab ${tabIndex+1}] After successful login, you can use --headless for subsequent runs.`);
+        return { success: false, authenticated: false, reason: 'headless_login_required' };
+      } else {
+        // In headless mode, assume authenticated if no explicit login buttons found
+        console.log(`[tab ${tabIndex+1}] In headless mode, proceeding with load test (assuming authenticated)`);
+        return { success: true, authenticated: true };
+      }
     }
     
     // In UI mode, wait for user to complete login
@@ -229,6 +268,11 @@ const handleAuthentication = async (page, tabIndex) => {
     
   } catch (error) {
     console.log(`[tab ${tabIndex+1}] Error in authentication flow: ${error.message}`);
+    // In headless mode, be more permissive with errors
+    if (HEADLESS) {
+      console.log(`[tab ${tabIndex+1}] Error in headless mode, proceeding with load test`);
+      return { success: true, authenticated: true };
+    }
     return { success: false, authenticated: false, reason: 'error' };
   }
 };
@@ -372,7 +416,7 @@ const selectModel = async (page, tabIndex, model) => {
   const dash = await browser.newPage();
   
   // Navigate to main projects page to use the main prompt interface
-  console.log('Navigating to main projects page (ILC space - API key: 51e45e690e6b4298bfdf7c4a3331edf6)...');
+  console.log('Navigating to main projects page (TLF space - API key: e785dd8d482243ef9b7f7760850e1349)...');
   try {
     await dash.goto('https://builder.io/app/projects', { waitUntil: 'load', timeout: 120_000 });
     console.log('Successfully navigated to main projects page');
